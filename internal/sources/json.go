@@ -54,19 +54,48 @@ func CountAlerts(v any) int {
 // CountActionableUpdates walks the update-shim /api/containers response
 // and counts entries where updateAvailable=true.
 func CountActionableUpdates(v any) int {
+	return len(ActionableUpdates(v))
+}
+
+type ContainerUpdate struct {
+	Name      string
+	OldTag    string
+	NewTag    string
+	Tier      string
+	IsMajor   bool
+	Actionable bool
+}
+
+// ActionableUpdates returns the list of containers with updateAvailable=true,
+// preserving the WUD/update-shim shape we render in the feed.
+func ActionableUpdates(v any) []ContainerUpdate {
 	arr, ok := v.([]any)
 	if !ok {
-		return 0
+		return nil
 	}
-	n := 0
+	var out []ContainerUpdate
 	for _, item := range arr {
 		obj, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		if b, ok := obj["updateAvailable"].(bool); ok && b {
-			n++
+		if b, _ := obj["updateAvailable"].(bool); !b {
+			continue
 		}
+		u := ContainerUpdate{}
+		u.Name, _ = obj["name"].(string)
+		if image, ok := obj["image"].(map[string]any); ok {
+			if tag, ok := image["tag"].(map[string]any); ok {
+				u.OldTag, _ = tag["value"].(string)
+			}
+		}
+		if result, ok := obj["result"].(map[string]any); ok {
+			u.NewTag, _ = result["tag"].(string)
+		}
+		u.Tier, _ = obj["homelab.tier"].(string)
+		u.IsMajor, _ = obj["homelab.is_major_bump"].(bool)
+		u.Actionable, _ = obj["homelab.actionable"].(bool)
+		out = append(out, u)
 	}
-	return n
+	return out
 }

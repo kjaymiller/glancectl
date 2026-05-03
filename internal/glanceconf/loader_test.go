@@ -41,4 +41,29 @@ func TestLoadHomelab(t *testing.T) {
 	if w := c.FindCustomAPI("update"); w == nil || w.URL == "" {
 		t.Error("expected an updates custom-api widget")
 	}
+
+	mid := c.MiddleWidgets()
+	if len(mid) == 0 {
+		t.Fatal("expected widgets in the wide column")
+	}
+	wantTypes := map[string]bool{"custom-api": false, "weather": false}
+	for _, w := range mid {
+		if _, ok := wantTypes[w.Type]; ok {
+			wantTypes[w.Type] = true
+		}
+	}
+	for typ, seen := range wantTypes {
+		if !seen {
+			t.Errorf("middle column missing widget type %q", typ)
+		}
+	}
+
+	// Spot-check braves widget has parameters captured.
+	for _, w := range mid {
+		if w.Type == "custom-api" && w.Title != "" && contains(lower(w.Title), "brave") {
+			if w.Parameters["teamId"] == "" {
+				t.Errorf("braves widget missing teamId param; got %v", w.Parameters)
+			}
+		}
+	}
 }

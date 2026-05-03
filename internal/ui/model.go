@@ -18,16 +18,16 @@ import (
 type pane int
 
 const (
-	paneServices pane = iota
-	paneActions
-	paneBookmarks
+	paneLeft pane = iota
+	paneMiddle
+	paneRight
 	numPanes
 )
 
 type Options struct {
 	Config       *glanceconf.Config
 	Workdir      string        // where to run `just`
-	RefreshEvery time.Duration // services + counts refresh
+	RefreshEvery time.Duration // services + counts + cards refresh
 	HTTPTimeout  time.Duration // per-request HTTP timeout
 }
 
@@ -37,28 +37,30 @@ type Model struct {
 	width, height int
 	focus         pane
 
-	// services pane
+	// left pane: services + actions, combined cursor.
 	sites   []sources.Site
 	health  []sources.HealthResult
-	svcCur  int
-
-	// actions pane
 	recipes []sources.Recipe
-	actCur  int
+	leftCur int // 0..len(sites)-1 → service; len(sites)..→ action
 
-	// bookmarks pane
+	// middle pane: cards built from MiddleWidgets, scrolled vertically.
+	midWidgets []glanceconf.Widget
+	midData    []any // per-widget fetched data, parallel to midWidgets
+	midOffset  int
+	weather    *sources.CachedWeather
+
+	// right pane: bookmarks.
 	bookmarks []bookmarkEntry
 	bmCur     int
 
-	// counts (footer)
+	// footer counts
 	alertCount  int
 	updateCount int
 
 	// runner output
-	running   bool
-	runTitle  string
-	runOutput strings.Builder
-
+	running    bool
+	runTitle   string
+	runOutput  strings.Builder
 	statusLine string
 }
 
@@ -86,30 +88,47 @@ func New(opts Options) Model {
 			m.bookmarks = append(m.bookmarks, bookmarkEntry{Title: l.Title, URL: l.URL})
 		}
 	}
-	// Skip past the first header so the cursor starts on a real entry.
 	if len(m.bookmarks) > 0 && m.bookmarks[0].IsHeader {
 		m.bmCur = 1
+	}
+
+	m.midWidgets = opts.Config.MiddleWidgets()
+	m.midData = make([]any, len(m.midWidgets))
+	for _, w := range m.midWidgets {
+		if w.Type == "weather" && m.weather == nil {
+			m.weather = sources.NewCachedWeather(w.Location, w.Units)
+		}
 	}
 	return m
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		m.refreshHealthCmd(),
 		m.refreshCountsCmd(),
 		m.refreshRecipesCmd(),
 		m.tickCmd(),
-	)
+	}
+	for i := range m.midWidgets {
+		cmds = append(cmds, m.refreshCardCmd(i))
+	}
+	return tea.Batch(cmds...)
 }
 
 // ── messages ──────────────────────────────────────────────────────────
 
 type tickMsg time.Time
 type healthMsg []sources.HealthResult
-type countsMsg struct {
-	alerts, updates int
-}
+type countsMsg struct{ alerts, updates int }
 type recipesMsg []sources.Recipe
+type cardMsg struct {
+	idx  int
+	data any
+}
+type runResultMsg struct {
+	output []byte
+	err    error
+}
 
 // ── commands ──────────────────────────────────────────────────────────
 
@@ -155,12 +174,46 @@ func (m Model) refreshRecipesCmd() tea.Cmd {
 	}
 }
 
-type runResultMsg struct {
-	output []byte
-	err    error
+func (m Model) refreshCardCmd(idx int) tea.Cmd {
+	if idx < 0 || idx >= len(m.midWidgets) {
+		return nil
+	}
+	w := m.midWidgets[idx]
+	timeout := m.opts.HTTPTimeout
+	weather := m.weather
+	return func() tea.Msg {
+		ctx := context.Background()
+		var data any
+		var err error
+		switch {
+		case w.Type == "weather" && weather != nil:
+			data, err = weather.Fetch(ctx, timeout)
+		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "brave"):
+			data, err = sources.FetchSchedule(ctx, w.URL, w.Parameters, timeout)
+		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "update"):
+			var v any
+			v, err = sources.FetchJSON(ctx, w.URL, w.Headers, timeout)
+			if err == nil {
+				data = sources.ActionableUpdates(v)
+			}
+		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "channels"):
+			data, err = sources.FetchYtdlChannels(ctx, w.URL, w.Headers, timeout)
+		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "runs"):
+			data, err = sources.FetchYtdlRuns(ctx, w.URL, w.Headers, timeout)
+		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "alert"):
+			var v any
+			v, err = sources.FetchJSON(ctx, w.URL, w.Headers, timeout)
+			if err == nil {
+				data = sources.CountAlerts(v)
+			}
+		}
+		if err != nil {
+			data = err
+		}
+		return cardMsg{idx: idx, data: data}
+	}
 }
 
-// runRecipe runs `just <name>` and returns the captured output + status.
 func (m *Model) runRecipe(name string) tea.Cmd {
 	wd := m.opts.Workdir
 	m.running = true
@@ -183,7 +236,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		return m, tea.Batch(m.refreshHealthCmd(), m.refreshCountsCmd(), m.tickCmd())
+		cmds := []tea.Cmd{m.refreshHealthCmd(), m.refreshCountsCmd(), m.tickCmd()}
+		for i := range m.midWidgets {
+			cmds = append(cmds, m.refreshCardCmd(i))
+		}
+		return m, tea.Batch(cmds...)
 
 	case healthMsg:
 		m.health = []sources.HealthResult(msg)
@@ -196,6 +253,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case recipesMsg:
 		m.recipes = []sources.Recipe(msg)
+		return m, nil
+
+	case cardMsg:
+		if msg.idx >= 0 && msg.idx < len(m.midData) {
+			m.midData[msg.idx] = msg.data
+		}
 		return m, nil
 
 	case runResultMsg:
@@ -225,7 +288,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = (m.focus + numPanes - 1) % numPanes
 		return m, nil
 	case "r":
-		return m, tea.Batch(m.refreshHealthCmd(), m.refreshCountsCmd(), m.refreshRecipesCmd())
+		cmds := []tea.Cmd{m.refreshHealthCmd(), m.refreshCountsCmd(), m.refreshRecipesCmd()}
+		for i := range m.midWidgets {
+			cmds = append(cmds, m.refreshCardCmd(i))
+		}
+		return m, tea.Batch(cmds...)
 	case "esc":
 		m.runOutput.Reset()
 		m.runTitle = ""
@@ -244,18 +311,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) moveCursor(d int) {
 	switch m.focus {
-	case paneServices:
-		if n := len(m.sites); n > 0 {
-			m.svcCur = clamp(m.svcCur+d, 0, n-1)
+	case paneLeft:
+		n := len(m.sites) + len(m.recipes)
+		if n > 0 {
+			m.leftCur = clamp(m.leftCur+d, 0, n-1)
 		}
-	case paneActions:
-		if n := len(m.recipes); n > 0 {
-			m.actCur = clamp(m.actCur+d, 0, n-1)
-		}
-	case paneBookmarks:
+	case paneMiddle:
+		m.midOffset = clamp(m.midOffset+d, 0, m.midScrollMax())
+	case paneRight:
 		if n := len(m.bookmarks); n > 0 {
 			next := clamp(m.bmCur+d, 0, n-1)
-			// Skip over header rows.
 			for next >= 0 && next < n && m.bookmarks[next].IsHeader {
 				next += d
 				if next < 0 || next >= n {
@@ -267,18 +332,25 @@ func (m *Model) moveCursor(d int) {
 	}
 }
 
+func (m Model) midScrollMax() int {
+	// Only known after View() runs (depends on geometry); approximate
+	// with a generous cap. moveCursor will clamp again on next render.
+	return 200
+}
+
 func (m Model) activate() (tea.Model, tea.Cmd) {
 	switch m.focus {
-	case paneServices:
-		if m.svcCur < len(m.sites) {
-			openURL(m.sites[m.svcCur].URL)
+	case paneLeft:
+		if m.leftCur < len(m.sites) {
+			openURL(m.sites[m.leftCur].URL)
+		} else {
+			ai := m.leftCur - len(m.sites)
+			if ai >= 0 && ai < len(m.recipes) && !m.running {
+				cmd := (&m).runRecipe(m.recipes[ai].Name)
+				return m, cmd
+			}
 		}
-	case paneActions:
-		if m.actCur < len(m.recipes) && !m.running {
-			cmd := (&m).runRecipe(m.recipes[m.actCur].Name)
-			return m, cmd
-		}
-	case paneBookmarks:
+	case paneRight:
 		if m.bmCur < len(m.bookmarks) {
 			b := m.bookmarks[m.bmCur]
 			if !b.IsHeader && b.URL != "" {
@@ -314,28 +386,35 @@ func (m Model) View() string {
 		return "loading…"
 	}
 
-	// Header
 	header := titleBar.Render(" glancectl ") + "  " +
 		subtle.Render(fmt.Sprintf("config pages: %d", len(m.opts.Config.Pages)))
 
-	// Body: 3 columns. Reserve rows for header(1)+spacer(1)+runner+footer(1).
 	runnerRows := 0
 	if m.running || m.runOutput.Len() > 0 {
 		runnerRows = 8
 	}
 	bodyHeight := m.height - 3 - runnerRows
-	if bodyHeight < 6 {
-		bodyHeight = 6
+	if bodyHeight < 8 {
+		bodyHeight = 8
 	}
 
-	colW := (m.width - 2) / 3
-	if colW < 18 {
-		colW = 18
+	// Column widths: left small, middle wide, right small.
+	leftW := m.width / 5
+	rightW := m.width / 5
+	if leftW < 22 {
+		leftW = 22
+	}
+	if rightW < 22 {
+		rightW = 22
+	}
+	midW := m.width - leftW - rightW
+	if midW < 30 {
+		midW = 30
 	}
 
-	left := m.renderServices(colW, bodyHeight)
-	mid := m.renderActions(colW, bodyHeight)
-	right := m.renderBookmarks(m.width-2*colW, bodyHeight)
+	left := m.renderLeft(leftW, bodyHeight)
+	mid := m.renderMiddle(midW, bodyHeight)
+	right := m.renderRight(rightW, bodyHeight)
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, mid, right)
 
@@ -347,14 +426,17 @@ func (m Model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-func (m Model) renderServices(w, h int) string {
-	title := "Services"
+func (m Model) renderLeft(w, h int) string {
+	title := "Services / Actions"
 	header := paneTitle.Render(title)
-	if m.focus == paneServices {
+	if m.focus == paneLeft {
 		header = paneTitleFocused.Render(title)
 	}
 	var lines []string
 	lines = append(lines, header, "")
+
+	// Services
+	lines = append(lines, groupSt.Render("Services"))
 	for i, s := range m.sites {
 		mark := subtle.Render("·")
 		if i < len(m.health) {
@@ -369,22 +451,13 @@ func (m Model) renderServices(w, h int) string {
 			}
 		}
 		row := fmt.Sprintf("%s %s", mark, truncate(s.Title, w-6))
-		if i == m.svcCur && m.focus == paneServices {
+		if m.focus == paneLeft && m.leftCur == i {
 			row = selected.Render(row)
 		}
 		lines = append(lines, row)
 	}
-	return paneOf(m.focus == paneServices).Width(w).Height(h).Render(strings.Join(lines, "\n"))
-}
 
-func (m Model) renderActions(w, h int) string {
-	title := "Actions"
-	header := paneTitle.Render(title)
-	if m.focus == paneActions {
-		header = paneTitleFocused.Render(title)
-	}
-	var lines []string
-	lines = append(lines, header, "")
+	lines = append(lines, "", groupSt.Render("Actions"))
 	lastGroup := ""
 	for i, r := range m.recipes {
 		if r.Group != lastGroup {
@@ -392,23 +465,53 @@ func (m Model) renderActions(w, h int) string {
 				lines = append(lines, "")
 			}
 			if r.Group != "" {
-				lines = append(lines, groupSt.Render("["+r.Group+"]"))
+				lines = append(lines, subtle.Render("["+r.Group+"]"))
 			}
 			lastGroup = r.Group
 		}
 		row := "  " + truncate(r.Name, w-6)
-		if i == m.actCur && m.focus == paneActions {
+		idx := len(m.sites) + i
+		if m.focus == paneLeft && m.leftCur == idx {
 			row = selected.Render(row)
 		}
 		lines = append(lines, row)
 	}
-	return paneOf(m.focus == paneActions).Width(w).Height(h).Render(strings.Join(lines, "\n"))
+	return paneOf(m.focus == paneLeft).Width(w).Height(h).Render(strings.Join(lines, "\n"))
 }
 
-func (m Model) renderBookmarks(w, h int) string {
+func (m Model) renderMiddle(w, h int) string {
+	title := "Feed"
+	header := paneTitle.Render(title)
+	if m.focus == paneMiddle {
+		header = paneTitleFocused.Render(title)
+	}
+	var lines []string
+	lines = append(lines, header, "")
+
+	for i, wd := range m.midWidgets {
+		c := BuildCard(wd, m.midData[i])
+		if i > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, accent.Bold(true).Render(c.Title))
+		lines = append(lines, c.Lines...)
+	}
+
+	// Vertical scroll: drop the first midOffset lines after the header.
+	if len(lines) > 2 && m.midOffset > 0 {
+		off := m.midOffset
+		if off > len(lines)-2 {
+			off = len(lines) - 2
+		}
+		lines = append(lines[:2], lines[2+off:]...)
+	}
+	return paneOf(m.focus == paneMiddle).Width(w).Height(h).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) renderRight(w, h int) string {
 	title := "Bookmarks"
 	header := paneTitle.Render(title)
-	if m.focus == paneBookmarks {
+	if m.focus == paneRight {
 		header = paneTitleFocused.Render(title)
 	}
 	var lines []string
@@ -419,12 +522,12 @@ func (m Model) renderBookmarks(w, h int) string {
 			continue
 		}
 		row := "  " + truncate(b.Title, w-6)
-		if i == m.bmCur && m.focus == paneBookmarks {
+		if m.focus == paneRight && m.bmCur == i {
 			row = selected.Render(row)
 		}
 		lines = append(lines, row)
 	}
-	return paneOf(m.focus == paneBookmarks).Width(w).Height(h).Render(strings.Join(lines, "\n"))
+	return paneOf(m.focus == paneRight).Width(w).Height(h).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) renderRunner(w, h int) string {
@@ -434,8 +537,7 @@ func (m Model) renderRunner(w, h int) string {
 	} else if m.statusLine != "" {
 		header += " " + subtle.Render("("+m.statusLine+")")
 	}
-	body := m.runOutput.String()
-	body = lastLines(body, h-3)
+	body := lastLines(m.runOutput.String(), h-3)
 	content := strings.Join([]string{header, "", body}, "\n")
 	return paneBox.Width(w - 2).Height(h - 1).Render(content)
 }

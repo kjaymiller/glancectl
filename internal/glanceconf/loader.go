@@ -29,16 +29,22 @@ type Column struct {
 // Widget is the lowest-common-denominator shape we extract from each
 // supported widget type. Type-specific fields are populated when present.
 type Widget struct {
-	Type    string
-	Title   string
-	URL     string
-	Headers map[string]string
+	Type       string
+	Title      string
+	URL        string
+	Headers    map[string]string
+	Parameters map[string]string // custom-api query params
 
 	// monitor
 	Sites []Site
 
 	// bookmarks
 	Groups []BookmarkGroup
+
+	// weather
+	Location   string
+	Units      string
+	HourFormat string
 }
 
 type Site struct {
@@ -96,10 +102,14 @@ type rawConfig struct {
 }
 
 type rawWidget struct {
-	Type    string            `yaml:"type"`
-	Title   string            `yaml:"title"`
-	URL     string            `yaml:"url"`
-	Headers map[string]string `yaml:"headers"`
+	Type       string            `yaml:"type"`
+	Title      string            `yaml:"title"`
+	URL        string            `yaml:"url"`
+	Headers    map[string]string `yaml:"headers"`
+	Parameters map[string]string `yaml:"parameters"`
+	Location   string            `yaml:"location"`
+	Units      string            `yaml:"units"`
+	HourFormat string            `yaml:"hour-format"`
 
 	Sites []struct {
 		Title string `yaml:"title"`
@@ -132,13 +142,20 @@ func flattenWidgets(in []rawWidget) []Widget {
 
 func convert(w rawWidget) Widget {
 	out := Widget{
-		Type:    w.Type,
-		Title:   expand(w.Title),
-		URL:     expand(w.URL),
-		Headers: map[string]string{},
+		Type:       w.Type,
+		Title:      expand(w.Title),
+		URL:        expand(w.URL),
+		Headers:    map[string]string{},
+		Parameters: map[string]string{},
+		Location:   expand(w.Location),
+		Units:      w.Units,
+		HourFormat: w.HourFormat,
 	}
 	for k, v := range w.Headers {
 		out.Headers[k] = expand(v)
+	}
+	for k, v := range w.Parameters {
+		out.Parameters[k] = expand(v)
 	}
 	for _, s := range w.Sites {
 		out.Sites = append(out.Sites, Site{Title: expand(s.Title), URL: expand(s.URL)})
@@ -259,6 +276,30 @@ func (c *Config) Bookmarks() []BookmarkGroup {
 				if w.Type == "bookmarks" {
 					out = append(out, w.Groups...)
 				}
+			}
+		}
+	}
+	return out
+}
+
+// MiddleWidgets returns every widget in the widest column of the first
+// page (the "feature" column in Glance), in document order. Falls back
+// to all non-monitor/non-bookmarks widgets if no column is `size: full`.
+func (c *Config) MiddleWidgets() []Widget {
+	if len(c.Pages) == 0 {
+		return nil
+	}
+	page := c.Pages[0]
+	for _, col := range page.Columns {
+		if col.Size == "full" {
+			return col.Widgets
+		}
+	}
+	var out []Widget
+	for _, col := range page.Columns {
+		for _, w := range col.Widgets {
+			if w.Type != "monitor" && w.Type != "bookmarks" {
+				out = append(out, w)
 			}
 		}
 	}
