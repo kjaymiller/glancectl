@@ -17,9 +17,14 @@ type Game struct {
 	GamePk   int
 }
 
-// FetchSchedule pulls the MLB statsapi schedule and filters to games
-// involving teamId. parameters comes straight from the Glance widget
-// (sportId, teamId, season, hydrate).
+// ScheduleWindow is the number of games returned around today.
+// 2 past + today/next + 2 after the focal game = 5 total.
+const ScheduleWindow = 5
+
+// FetchSchedule pulls the MLB statsapi schedule and returns a window of
+// ScheduleWindow games centered on the one closest to "now". parameters
+// comes straight from the Glance widget (sportId, teamId, season,
+// hydrate).
 func FetchSchedule(ctx context.Context, baseURL string, parameters map[string]string, timeout time.Duration) ([]Game, error) {
 	teamID := parameters["teamId"]
 	if teamID == "" {
@@ -39,16 +44,57 @@ func FetchSchedule(ctx context.Context, baseURL string, parameters map[string]st
 		return nil, fmt.Errorf("schedule: unexpected root")
 	}
 	dates, _ := root["dates"].([]any)
-	var out []Game
+	var all []Game
 	for _, d := range dates {
 		dm, _ := d.(map[string]any)
 		games, _ := dm["games"].([]any)
 		for _, g := range games {
 			gm, _ := g.(map[string]any)
-			out = append(out, parseGame(gm, teamID))
+			all = append(all, parseGame(gm, teamID))
 		}
 	}
-	return out, nil
+	return windowAroundNow(all, ScheduleWindow), nil
+}
+
+// windowAroundNow picks `size` games centered on the one whose date is
+// closest to now. Falls back to the first/last `size` if the schedule
+// is shorter or we're past the end. Assumes input is in chronological
+// order (statsapi returns it that way).
+func windowAroundNow(games []Game, size int) []Game {
+	if len(games) <= size {
+		return games
+	}
+	now := time.Now()
+	focal := 0
+	bestDiff := time.Duration(1<<62 - 1)
+	for i, g := range games {
+		if g.When.IsZero() {
+			continue
+		}
+		d := g.When.Sub(now)
+		if d < 0 {
+			d = -d
+		}
+		if d < bestDiff {
+			bestDiff = d
+			focal = i
+		}
+	}
+	half := size / 2
+	start := focal - half
+	end := start + size
+	if start < 0 {
+		end -= start
+		start = 0
+	}
+	if end > len(games) {
+		start -= end - len(games)
+		end = len(games)
+	}
+	if start < 0 {
+		start = 0
+	}
+	return games[start:end]
 }
 
 func parseGame(g map[string]any, teamID string) Game {
