@@ -8,13 +8,19 @@ import (
 )
 
 type Game struct {
-	When     time.Time
-	Status   string
-	Home     bool
-	Opponent string
-	Self     int
-	Other    int
-	GamePk   int
+	When       time.Time
+	Status     string
+	Home       bool
+	Opponent   string
+	Self       int
+	Other      int
+	GamePk     int
+	Inning     int    // current inning (in-progress games)
+	InningHalf string // "Top" / "Bottom" / "Middle" / "End"
+	Outs       int
+	OnFirst    bool
+	OnSecond   bool
+	OnThird    bool
 }
 
 // ScheduleWindow is the number of games returned around today.
@@ -106,6 +112,16 @@ func parseGame(g map[string]any, teamID string) Game {
 	if t, ok := g["gameDate"].(string); ok {
 		if parsed, err := time.Parse(time.RFC3339, t); err == nil {
 			out.When = parsed.Local()
+		}
+	}
+	if ls, ok := g["linescore"].(map[string]any); ok {
+		out.Inning = intOf(ls["currentInning"])
+		out.InningHalf, _ = ls["inningState"].(string)
+		out.Outs = intOf(ls["outs"])
+		if off, ok := ls["offense"].(map[string]any); ok {
+			_, out.OnFirst = off["onFirst"].(map[string]any)
+			_, out.OnSecond = off["onSecond"].(map[string]any)
+			_, out.OnThird = off["onThird"].(map[string]any)
 		}
 	}
 	teams, _ := g["teams"].(map[string]any)

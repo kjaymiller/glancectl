@@ -154,9 +154,26 @@ func renderGames(games []sources.Game) []string {
 		}
 		date := g.When.Format("Mon Jan 2")
 		score := g.Status
-		if strings.HasPrefix(g.Status, "Final") {
+		switch {
+		case strings.HasPrefix(g.Status, "Final"):
 			score = fmt.Sprintf("%s %d-%d", g.Status, g.Self, g.Other)
-		} else if g.When.After(time.Now()) {
+		case strings.HasPrefix(g.Status, "In Progress"), g.Status == "Manager Challenge", g.Status == "Delayed":
+			parts := []string{fmt.Sprintf("%d-%d", g.Self, g.Other)}
+			if g.Inning > 0 {
+				half := g.InningHalf
+				if half == "" {
+					half = "—"
+				}
+				parts = append(parts, fmt.Sprintf("%s %s", half, ordinal(g.Inning)))
+			}
+			if g.Inning > 0 {
+				parts = append(parts, fmt.Sprintf("%d out", g.Outs))
+			}
+			if bases := basesGlyph(g.OnFirst, g.OnSecond, g.OnThird); bases != "" {
+				parts = append(parts, bases)
+			}
+			score = strings.Join(parts, " · ")
+		case g.When.After(time.Now()):
 			score = g.When.Format("3:04pm")
 		}
 		out = append(out, fmt.Sprintf("%s %s %s %s — %s", mark, date, loc, g.Opponent, score))
@@ -187,4 +204,39 @@ func renderUpdates(ups []sources.ContainerUpdate) []string {
 
 func contains(s, sub string) bool {
 	return strings.Contains(s, sub)
+}
+
+// basesGlyph renders the runners-on-base state as a compact 3-char string
+// like "1-3" (first & third), "-2-" (just second), or "" if bases empty.
+func basesGlyph(first, second, third bool) string {
+	if !first && !second && !third {
+		return ""
+	}
+	g := []byte("---")
+	if first {
+		g[0] = '1'
+	}
+	if second {
+		g[1] = '2'
+	}
+	if third {
+		g[2] = '3'
+	}
+	return string(g)
+}
+
+// ordinal renders 1→"1st", 2→"2nd", etc. — for inning labels.
+func ordinal(n int) string {
+	suffix := "th"
+	if n%100 < 11 || n%100 > 13 {
+		switch n % 10 {
+		case 1:
+			suffix = "st"
+		case 2:
+			suffix = "nd"
+		case 3:
+			suffix = "rd"
+		}
+	}
+	return fmt.Sprintf("%d%s", n, suffix)
 }
