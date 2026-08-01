@@ -20,15 +20,17 @@ var version = "dev"
 
 func main() {
 	var (
-		cfgPath  string
-		envPath  string
-		workdir  string
-		refresh  time.Duration
-		showVer  bool
+		cfgPath string
+		envPath string
+		workdir string
+		rewrite string
+		refresh time.Duration
+		showVer bool
 	)
-	flag.StringVar(&cfgPath, "config", "configs/glance/glance.yml", "path to glance.yml")
-	flag.StringVar(&envPath, "env", "compose/glance/.env", "path to .env for ${VAR} substitution")
+	flag.StringVar(&cfgPath, "config", "", "path to glance.yml (default: $GLANCECTL_CONFIG_PATH, then ./configs/glance/glance.yml, then ~/.config/glancectl/glance.yml)")
+	flag.StringVar(&envPath, "env", "", "path to .env for ${VAR} substitution (default: $GLANCECTL_ENV_PATH, then .env beside the config)")
 	flag.StringVar(&workdir, "workdir", ".", "working directory for `just` commands")
+	flag.StringVar(&rewrite, "rewrite", "", "comma-separated host[:port]=replacement rules for URLs unreachable from this host (default: $GLANCECTL_REWRITE)")
 	flag.DurationVar(&refresh, "refresh", 30*time.Second, "auto-refresh interval")
 	flag.BoolVar(&showVer, "version", false, "print version and exit")
 	flag.Parse()
@@ -45,11 +47,27 @@ func main() {
 		return p
 	}
 
-	cfg, err := glanceconf.Load(abs(cfgPath), abs(envPath))
+	resolved, err := glanceconf.DiscoverConfig(cfgPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	cfg, err := glanceconf.Load(resolved, glanceconf.DiscoverEnvFile(envPath, resolved))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "load config:", err)
 		os.Exit(1)
 	}
+
+	if rewrite == "" {
+		rewrite = os.Getenv(glanceconf.RewriteEnvVar)
+	}
+	rules, err := glanceconf.ParseRewrites(rewrite)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	cfg.ApplyRewrites(rules)
 
 	m := ui.New(ui.Options{
 		Config:       cfg,

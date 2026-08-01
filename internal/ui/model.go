@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/kjaymiller/glancectl/internal/glanceconf"
 	"github.com/kjaymiller/glancectl/internal/sources"
@@ -37,17 +38,20 @@ type Model struct {
 	width, height int
 	focus         pane
 
-	// left pane: services + actions, combined cursor.
-	sites   []sources.Site
-	health  []sources.HealthResult
+	// left pane: active alerts + actions. Only actions take the cursor.
 	recipes []sources.Recipe
-	leftCur int // 0..len(sites)-1 → service; len(sites)..→ action
+	leftCur int
 
 	// middle pane: cards built from MiddleWidgets, scrolled vertically.
 	midWidgets []glanceconf.Widget
 	midData    []any // per-widget fetched data, parallel to midWidgets
 	midOffset  int
 	weather    *sources.CachedWeather
+
+	// alertIdx points into midWidgets/midData at the alerts widget, which
+	// renders in the left pane instead of the feed. -1 when the config has
+	// no alerts widget.
+	alertIdx int
 
 	// right pane: bookmarks.
 	bookmarks []bookmarkEntry
@@ -77,11 +81,8 @@ func New(opts Options) Model {
 	if opts.HTTPTimeout == 0 {
 		opts.HTTPTimeout = 5 * time.Second
 	}
-	m := Model{opts: opts}
+	m := Model{opts: opts, alertIdx: -1}
 
-	for _, s := range opts.Config.Sites() {
-		m.sites = append(m.sites, sources.Site{Title: s.Title, URL: s.URL})
-	}
 	for _, g := range opts.Config.Bookmarks() {
 		m.bookmarks = append(m.bookmarks, bookmarkEntry{IsHeader: true, Title: g.Title})
 		for _, l := range g.Links {
@@ -94,9 +95,14 @@ func New(opts Options) Model {
 
 	m.midWidgets = opts.Config.MiddleWidgets()
 	m.midData = make([]any, len(m.midWidgets))
-	for _, w := range m.midWidgets {
+	for i, w := range m.midWidgets {
 		if w.Type == "weather" && m.weather == nil {
 			m.weather = sources.NewCachedWeather(w.Location, w.Units)
+		}
+		// The alerts widget stays in midWidgets so it refreshes with the
+		// rest; only its rendering moves to the left pane.
+		if m.alertIdx < 0 && w.Type == "custom-api" && contains(strings.ToLower(w.Title), "alert") {
+			m.alertIdx = i
 		}
 	}
 	return m
@@ -104,7 +110,6 @@ func New(opts Options) Model {
 
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
-		m.refreshHealthCmd(),
 		m.refreshCountsCmd(),
 		m.refreshRecipesCmd(),
 		m.tickCmd(),
@@ -118,7 +123,6 @@ func (m Model) Init() tea.Cmd {
 // ── messages ──────────────────────────────────────────────────────────
 
 type tickMsg time.Time
-type healthMsg []sources.HealthResult
 type countsMsg struct{ alerts, updates int }
 type recipesMsg []sources.Recipe
 type cardMsg struct {
@@ -134,14 +138,6 @@ type runResultMsg struct {
 
 func (m Model) tickCmd() tea.Cmd {
 	return tea.Tick(m.opts.RefreshEvery, func(t time.Time) tea.Msg { return tickMsg(t) })
-}
-
-func (m Model) refreshHealthCmd() tea.Cmd {
-	sites := append([]sources.Site(nil), m.sites...)
-	timeout := m.opts.HTTPTimeout
-	return func() tea.Msg {
-		return healthMsg(sources.CheckAll(context.Background(), sites, timeout))
-	}
 }
 
 func (m Model) refreshCountsCmd() tea.Cmd {
@@ -188,6 +184,15 @@ func (m Model) refreshCardCmd(idx int) tea.Cmd {
 		switch {
 		case w.Type == "weather" && weather != nil:
 			data, err = weather.Fetch(ctx, timeout)
+		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "kuma"):
+			data, err = sources.FetchKumaUptime(ctx, w.URL, w.Headers, timeout)
+		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "prometheus"):
+			data, err = sources.FetchPromRange(ctx, w.URL, w.Parameters, timeout)
+		// First among the custom-api cases: "systems" collides with none of
+		// the sibling substrings, but a title like "System Updates" would be
+		// eaten by the "update" case below, so match it before them.
+		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "system"):
+			data, err = sources.FetchServiceStatus(ctx, w.URL, w.Headers, timeout)
 		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "brave"):
 			data, err = sources.FetchSchedule(ctx, w.URL, w.Parameters, timeout)
 		case w.Type == "custom-api" && contains(strings.ToLower(w.Title), "update"):
@@ -233,18 +238,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		// A resize can hide the focused pane; move focus somewhere visible
+		// so keys keep acting on something the user can see.
+		if !m.paneVisible(m.focus) {
+			m.focus = paneMiddle
+		}
 		return m, nil
 
 	case tickMsg:
-		cmds := []tea.Cmd{m.refreshHealthCmd(), m.refreshCountsCmd(), m.tickCmd()}
+		cmds := []tea.Cmd{m.refreshCountsCmd(), m.tickCmd()}
 		for i := range m.midWidgets {
 			cmds = append(cmds, m.refreshCardCmd(i))
 		}
 		return m, tea.Batch(cmds...)
-
-	case healthMsg:
-		m.health = []sources.HealthResult(msg)
-		return m, nil
 
 	case countsMsg:
 		m.alertCount = msg.alerts
@@ -282,20 +288,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 	case "tab":
-		m.focus = (m.focus + 1) % numPanes
+		m.focus = m.nextPane(+1)
 		return m, nil
 	case "shift+tab":
-		m.focus = (m.focus + numPanes - 1) % numPanes
+		m.focus = m.nextPane(-1)
 		return m, nil
 	case "r":
-		cmds := []tea.Cmd{m.refreshHealthCmd(), m.refreshCountsCmd(), m.refreshRecipesCmd()}
+		cmds := []tea.Cmd{m.refreshCountsCmd(), m.refreshRecipesCmd()}
 		for i := range m.midWidgets {
 			cmds = append(cmds, m.refreshCardCmd(i))
 		}
 		return m, tea.Batch(cmds...)
+	case "y":
+		m.statusLine = m.yank()
+		return m, nil
 	case "esc":
 		m.runOutput.Reset()
 		m.runTitle = ""
+		m.statusLine = ""
 		return m, nil
 	case "up", "k":
 		m.moveCursor(-1)
@@ -312,8 +322,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) moveCursor(d int) {
 	switch m.focus {
 	case paneLeft:
-		n := len(m.sites) + len(m.recipes)
-		if n > 0 {
+		if n := len(m.recipes); n > 0 {
 			m.leftCur = clamp(m.leftCur+d, 0, n-1)
 		}
 	case paneMiddle:
@@ -332,23 +341,26 @@ func (m *Model) moveCursor(d int) {
 	}
 }
 
+// midScrollMax is the largest useful feed offset: the point where the last
+// line sits at the bottom of the viewport. Scrolling past that would leave
+// the pane blank with no way to tell how far you had gone.
 func (m Model) midScrollMax() int {
-	// Only known after View() runs (depends on geometry); approximate
-	// with a generous cap. moveCursor will clamp again on next render.
-	return 200
+	visible := m.paneHeight(paneMiddle) - paneVChrome - 2
+	if visible < 1 {
+		visible = 1
+	}
+	if max := len(m.middleLines(m.paneWidth(paneMiddle))) - visible; max > 0 {
+		return max
+	}
+	return 0
 }
 
 func (m Model) activate() (tea.Model, tea.Cmd) {
 	switch m.focus {
 	case paneLeft:
-		if m.leftCur < len(m.sites) {
-			openURL(m.sites[m.leftCur].URL)
-		} else {
-			ai := m.leftCur - len(m.sites)
-			if ai >= 0 && ai < len(m.recipes) && !m.running {
-				cmd := (&m).runRecipe(m.recipes[ai].Name)
-				return m, cmd
-			}
+		if m.leftCur >= 0 && m.leftCur < len(m.recipes) && !m.running {
+			cmd := (&m).runRecipe(m.recipes[m.leftCur].Name)
+			return m, cmd
 		}
 	case paneRight:
 		if m.bmCur < len(m.bookmarks) {
@@ -379,6 +391,217 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
+// ── layout ────────────────────────────────────────────────────────────
+
+// paneChrome is the horizontal cost of paneBox's rounded border. lipgloss
+// Width() sizes the content box inside the border, so a pane occupies two
+// more columns than we ask for; every width below is an outer width, and
+// the render funcs subtract this before handing it to lipgloss.
+const paneChrome = 2
+
+// paneVChrome is the vertical equivalent: the box's top and bottom border
+// rows, which Height() likewise does not count.
+const paneVChrome = 2
+
+const (
+	minSideW = 22 // narrower than this and service names are unreadable
+	minMidW  = 32
+
+	// minStackH is the shortest a stacked pane can usefully be: two border
+	// rows, a title, a spacer, and two content rows. One content row is
+	// not enough — overflowing content spends it on the "N more" marker,
+	// leaving a pane that shows nothing but its own truncation.
+	minStackH = 6
+)
+
+type paneLayout struct {
+	pane   pane
+	width  int // outer, including paneChrome
+	height int // outer, including paneVChrome
+}
+
+// layout places the visible panes in the terminal. Above minMidW+minSideW
+// the panes sit side by side; below it there is no width to split, so they
+// stack vertically at full width instead — a phone-sized terminal gets the
+// whole dashboard scrolled down the screen rather than the feed alone.
+func (m Model) layout() []paneLayout {
+	side := m.width / 5
+	if side < minSideW {
+		side = minSideW
+	}
+	h := m.bodyHeight()
+	switch {
+	case m.width >= 2*side+minMidW:
+		return []paneLayout{
+			{paneLeft, side, h},
+			{paneMiddle, m.width - 2*side, h},
+			{paneRight, side, h},
+		}
+	case m.width >= side+minMidW:
+		return []paneLayout{{paneLeft, side, h}, {paneMiddle, m.width - side, h}}
+	default:
+		return m.stackedLayout(h)
+	}
+}
+
+// stackedLayout splits the body height down the column. Every pane gets
+// minStackH and the focused one absorbs the remainder, so tab doubles as
+// "expand this pane" on a display too narrow to show them side by side.
+// When even the minimums do not fit, panes drop in the same order the
+// horizontal layout drops them: right first, then left.
+func (m Model) stackedLayout(h int) []paneLayout {
+	order := []pane{paneLeft, paneMiddle, paneRight}
+	for len(order) > 1 && h < len(order)*minStackH {
+		if order[len(order)-1] == paneRight {
+			order = order[:len(order)-1]
+		} else {
+			order = order[1:]
+		}
+	}
+
+	focus := m.focus
+	if !containsPane(order, focus) {
+		focus = paneMiddle
+	}
+
+	out := make([]paneLayout, 0, len(order))
+	spare := h - len(order)*minStackH
+	for _, p := range order {
+		ph := minStackH
+		if spare > 0 && p == focus {
+			ph += spare
+		}
+		out = append(out, paneLayout{p, m.width, ph})
+	}
+	// A body shorter than the minimums still has to total exactly h, or
+	// the frame overshoots the terminal and scrolls the header away.
+	if spare < 0 {
+		out[len(out)-1].height += spare
+	}
+	return out
+}
+
+func containsPane(ps []pane, p pane) bool {
+	for _, x := range ps {
+		if x == p {
+			return true
+		}
+	}
+	return false
+}
+
+// bodyHeight is the room left for panes once the header, footer and (when
+// shown) the runner have taken their rows.
+func (m Model) bodyHeight() int {
+	runnerRows := 0
+	if m.running || m.runOutput.Len() > 0 {
+		runnerRows = runnerHeight
+	}
+	h := m.height - 2 - runnerRows
+	if h < paneVChrome+1 {
+		h = paneVChrome + 1
+	}
+	return h
+}
+
+const runnerHeight = 8
+
+// nextPane advances focus by d, skipping panes the current width hides.
+func (m Model) nextPane(d int) pane {
+	p := m.focus
+	for i := 0; i < int(numPanes); i++ {
+		p = (p + pane(d) + numPanes) % numPanes
+		if m.paneVisible(p) {
+			return p
+		}
+	}
+	return m.focus
+}
+
+// window clips lines to h rows starting at offset, replacing the first and
+// last visible rows with hidden-count markers when content is cut off. The
+// returned slice is always exactly h rows so panes keep a stable height.
+func window(lines []string, offset, h int) []string {
+	if h <= 0 {
+		return nil
+	}
+	if max := len(lines) - h; offset > max {
+		offset = max
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	end := offset + h
+	if end > len(lines) {
+		end = len(lines)
+	}
+	out := append([]string(nil), lines[offset:end]...)
+	if offset > 0 && len(out) > 0 {
+		out[0] = subtle.Render(fmt.Sprintf("↑ %d more", offset))
+	}
+	if end < len(lines) && len(out) > 0 {
+		out[len(out)-1] = subtle.Render(fmt.Sprintf("↓ %d more", len(lines)-end+1))
+	}
+	for len(out) < h {
+		out = append(out, "")
+	}
+	return out
+}
+
+// scrollTo returns the offset that brings line cur into a viewport of h
+// rows, preferring the smallest movement from the current offset. Used by
+// the cursor panes, which scroll to follow the selection rather than being
+// scrolled directly.
+func scrollTo(cur, offset, h, total int) int {
+	if h <= 0 || total <= h {
+		return 0
+	}
+	if cur < offset+1 {
+		offset = cur - 1 // keep a row of context above where possible
+	}
+	if cur > offset+h-2 {
+		offset = cur - h + 2
+	}
+	return clamp(offset, 0, total-h)
+}
+
+func (m Model) paneVisible(p pane) bool {
+	return m.paneHeight(p) > 0
+}
+
+// paneHeight reports the outer height the layout gave a pane, or 0 when it
+// is hidden at the current size.
+func (m Model) paneHeight(p pane) int {
+	for _, l := range m.layout() {
+		if l.pane == p {
+			return l.height
+		}
+	}
+	return 0
+}
+
+// paneWidth is paneHeight's horizontal twin, minus the border, so callers
+// get the width content actually has to work with. Zero when the pane is
+// not in the current layout (dropped on a narrow terminal).
+func (m Model) paneWidth(p pane) int {
+	for _, l := range m.layout() {
+		if l.pane == p {
+			return l.width - paneChrome
+		}
+	}
+	return 0
+}
+
+// stacked reports whether the terminal is too narrow to put panes side by
+// side, so they run down the screen instead.
+func (m Model) stacked() bool {
+	side := m.width / 5
+	if side < minSideW {
+		side = minSideW
+	}
+	return m.width < side+minMidW
+}
+
 // ── view ──────────────────────────────────────────────────────────────
 
 func (m Model) View() string {
@@ -391,32 +614,28 @@ func (m Model) View() string {
 
 	runnerRows := 0
 	if m.running || m.runOutput.Len() > 0 {
-		runnerRows = 8
-	}
-	bodyHeight := m.height - 3 - runnerRows
-	if bodyHeight < 8 {
-		bodyHeight = 8
+		runnerRows = runnerHeight
 	}
 
-	// Column widths: left small, middle wide, right small.
-	leftW := m.width / 5
-	rightW := m.width / 5
-	if leftW < 22 {
-		leftW = 22
+	// The frame must total exactly m.height: one header row, one footer
+	// row, the runner if shown, and the panes take the rest. A single row
+	// of overshoot scrolls the terminal and pushes the header off-screen.
+	panes := m.layout()
+	var cols []string
+	for _, p := range panes {
+		switch p.pane {
+		case paneLeft:
+			cols = append(cols, m.renderLeft(p.width, p.height))
+		case paneMiddle:
+			cols = append(cols, m.renderMiddle(p.width, p.height))
+		case paneRight:
+			cols = append(cols, m.renderRight(p.width, p.height))
+		}
 	}
-	if rightW < 22 {
-		rightW = 22
+	body := lipgloss.JoinHorizontal(lipgloss.Top, cols...)
+	if m.stacked() {
+		body = lipgloss.JoinVertical(lipgloss.Left, cols...)
 	}
-	midW := m.width - leftW - rightW
-	if midW < 30 {
-		midW = 30
-	}
-
-	left := m.renderLeft(leftW, bodyHeight)
-	mid := m.renderMiddle(midW, bodyHeight)
-	right := m.renderRight(rightW, bodyHeight)
-
-	body := lipgloss.JoinHorizontal(lipgloss.Top, left, mid, right)
 
 	parts := []string{header, body}
 	if runnerRows > 0 {
@@ -426,38 +645,20 @@ func (m Model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-func (m Model) renderLeft(w, h int) string {
-	title := "Services / Actions"
-	header := paneTitle.Render(title)
-	if m.focus == paneLeft {
-		header = paneTitleFocused.Render(title)
-	}
+// leftLines builds the pane's scrollable content and reports which line
+// the cursor sits on, so the viewport can follow the selection.
+func (m Model) leftLines(w int) ([]string, int) {
 	var lines []string
-	lines = append(lines, header, "")
+	cursor := 0
 
-	// Services
-	lines = append(lines, groupSt.Render("Services"))
-	for i, s := range m.sites {
-		mark := subtle.Render("·")
-		if i < len(m.health) {
-			h := m.health[i]
-			switch {
-			case h.Err != nil:
-				mark = bad.Render("✗")
-			case h.Status >= 200 && h.Status < 400:
-				mark = good.Render("✓")
-			case h.Status >= 400:
-				mark = warn.Render(fmt.Sprintf("%d", h.Status))
-			}
-		}
-		row := fmt.Sprintf("%s %s", mark, truncate(s.Title, w-6))
-		if m.focus == paneLeft && m.leftCur == i {
-			row = selected.Render(row)
-		}
-		lines = append(lines, row)
+	if m.alertIdx >= 0 {
+		c := BuildCard(m.midWidgets[m.alertIdx], m.midData[m.alertIdx], w)
+		lines = append(lines, groupSt.Render(c.Title))
+		lines = append(lines, c.Lines...)
+		lines = append(lines, "")
 	}
 
-	lines = append(lines, "", groupSt.Render("Actions"))
+	lines = append(lines, groupSt.Render("Actions"))
 	lastGroup := ""
 	for i, r := range m.recipes {
 		if r.Group != lastGroup {
@@ -470,64 +671,85 @@ func (m Model) renderLeft(w, h int) string {
 			lastGroup = r.Group
 		}
 		row := "  " + truncate(r.Name, w-6)
-		idx := len(m.sites) + i
-		if m.focus == paneLeft && m.leftCur == idx {
-			row = selected.Render(row)
+		if m.leftCur == i {
+			cursor = len(lines)
+			if m.focus == paneLeft {
+				row = selected.Render(row)
+			}
 		}
 		lines = append(lines, row)
 	}
-	return paneOf(m.focus == paneLeft).Width(w).Height(h).Render(strings.Join(lines, "\n"))
+	return lines, cursor
 }
 
-func (m Model) renderMiddle(w, h int) string {
-	title := "Feed"
-	header := paneTitle.Render(title)
-	if m.focus == paneMiddle {
-		header = paneTitleFocused.Render(title)
-	}
-	var lines []string
-	lines = append(lines, header, "")
+func (m Model) renderLeft(w, h int) string {
+	lines, cursor := m.leftLines(w)
+	inner := h - paneVChrome
+	body := window(lines, scrollTo(cursor, 0, inner-2, len(lines)), inner-2)
+	return m.paneBoxed(paneLeft, "Alerts / Actions", body, w, inner)
+}
 
+// middleLines builds the feed's cards as one flat, scrollable list. w is
+// the pane's content width, which column-laying cards size against.
+func (m Model) middleLines(w int) []string {
+	var lines []string
 	for i, wd := range m.midWidgets {
-		c := BuildCard(wd, m.midData[i])
-		if i > 0 {
+		if i == m.alertIdx { // rendered in the left pane instead
+			continue
+		}
+		if len(lines) > 0 {
 			lines = append(lines, "")
 		}
+		c := BuildCard(wd, m.midData[i], w)
 		lines = append(lines, accent.Bold(true).Render(c.Title))
 		lines = append(lines, c.Lines...)
 	}
-
-	// Vertical scroll: drop the first midOffset lines after the header.
-	if len(lines) > 2 && m.midOffset > 0 {
-		off := m.midOffset
-		if off > len(lines)-2 {
-			off = len(lines) - 2
-		}
-		lines = append(lines[:2], lines[2+off:]...)
-	}
-	return paneOf(m.focus == paneMiddle).Width(w).Height(h).Render(strings.Join(lines, "\n"))
+	return lines
 }
 
-func (m Model) renderRight(w, h int) string {
-	title := "Bookmarks"
-	header := paneTitle.Render(title)
-	if m.focus == paneRight {
-		header = paneTitleFocused.Render(title)
-	}
+func (m Model) renderMiddle(w, h int) string {
+	inner := h - paneVChrome
+	body := window(m.middleLines(w-paneChrome), m.midOffset, inner-2)
+	return m.paneBoxed(paneMiddle, "Feed", body, w, inner)
+}
+
+func (m Model) rightLines(w int) ([]string, int) {
 	var lines []string
-	lines = append(lines, header, "")
+	cursor := 0
 	for i, b := range m.bookmarks {
 		if b.IsHeader {
 			lines = append(lines, groupSt.Render(b.Title))
 			continue
 		}
 		row := "  " + truncate(b.Title, w-6)
-		if m.focus == paneRight && m.bmCur == i {
-			row = selected.Render(row)
+		if m.bmCur == i {
+			cursor = len(lines)
+			if m.focus == paneRight {
+				row = selected.Render(row)
+			}
 		}
 		lines = append(lines, row)
 	}
-	return paneOf(m.focus == paneRight).Width(w).Height(h).Render(strings.Join(lines, "\n"))
+	return lines, cursor
+}
+
+func (m Model) renderRight(w, h int) string {
+	lines, cursor := m.rightLines(w)
+	inner := h - paneVChrome
+	body := window(lines, scrollTo(cursor, 0, inner-2, len(lines)), inner-2)
+	return m.paneBoxed(paneRight, "Bookmarks", body, w, inner)
+}
+
+// paneBoxed frames a pane: focus-aware title, blank spacer, then the
+// already-windowed body. Height is the inner content height, so the box
+// renders exactly h+paneVChrome rows.
+func (m Model) paneBoxed(p pane, title string, body []string, w, inner int) string {
+	header := paneTitle.Render(title)
+	if m.focus == p {
+		header = paneTitleFocused.Render(title)
+	}
+	lines := append([]string{header, ""}, body...)
+	return paneOf(m.focus == p).Width(w - paneChrome).Height(inner).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) renderRunner(w, h int) string {
@@ -550,11 +772,18 @@ func (m Model) renderFooter() string {
 		"tab pane",
 		"↑/↓ nav",
 		"enter act",
+		"y copy",
 		"r refresh",
 		"esc close",
 		"q quit",
 	}
-	return footer.Width(m.width).Render(strings.Join(bits, "  "))
+	help := strings.Join(bits, "  ")
+	// The status line reports the result of the last action (a yank, a
+	// finished recipe); it earns the footer when there is one to show.
+	if m.statusLine != "" {
+		help = accent.Render(m.statusLine) + "  " + subtle.Render("· esc to clear")
+	}
+	return footer.Width(m.width).Render(ansi.Truncate(help, m.width-2, "…"))
 }
 
 func paneOf(focused bool) lipgloss.Style {

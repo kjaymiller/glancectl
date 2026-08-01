@@ -69,7 +69,7 @@ func Load(path, envFile string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := resolveIncludes(root, filepath.Dir(path)); err != nil {
+	if err := resolveIncludes(root, includeBaseDir(path)); err != nil {
 		return nil, err
 	}
 
@@ -182,6 +182,17 @@ func expand(s string) string {
 	})
 }
 
+// includeBaseDir returns the directory that `$include` paths inside the file at
+// path are relative to. Symlinks are resolved first: a config symlinked
+// into ~/.config/glancectl must still find the includes sitting next to
+// its real location.
+func includeBaseDir(path string) string {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Dir(real)
+	}
+	return filepath.Dir(path)
+}
+
 func readNode(path string) (*yaml.Node, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -212,7 +223,7 @@ func resolveIncludes(n *yaml.Node, baseDir string) error {
 			if err != nil {
 				return err
 			}
-			if err := resolveIncludes(incNode, filepath.Dir(incPath)); err != nil {
+			if err := resolveIncludes(incNode, includeBaseDir(incPath)); err != nil {
 				return err
 			}
 			doc := unwrapDoc(incNode)
@@ -282,21 +293,31 @@ func (c *Config) Bookmarks() []BookmarkGroup {
 	return out
 }
 
-// MiddleWidgets returns every widget in the widest column of the first
-// page (the "feature" column in Glance), in document order. Falls back
-// to all non-monitor/non-bookmarks widgets if no column is `size: full`.
+// MiddleWidgets returns every renderable widget on the first page, that
+// is, every widget in every column whose type is neither monitor nor
+// bookmarks (those get their own panes). Widgets from `size: full`
+// columns come first, then the remaining columns; within each column
+// document order is preserved.
 func (c *Config) MiddleWidgets() []Widget {
 	if len(c.Pages) == 0 {
 		return nil
 	}
 	page := c.Pages[0]
-	for _, col := range page.Columns {
-		if col.Size == "full" {
-			return col.Widgets
-		}
-	}
 	var out []Widget
 	for _, col := range page.Columns {
+		if col.Size != "full" {
+			continue
+		}
+		for _, w := range col.Widgets {
+			if w.Type != "monitor" && w.Type != "bookmarks" {
+				out = append(out, w)
+			}
+		}
+	}
+	for _, col := range page.Columns {
+		if col.Size == "full" {
+			continue
+		}
 		for _, w := range col.Widgets {
 			if w.Type != "monitor" && w.Type != "bookmarks" {
 				out = append(out, w)

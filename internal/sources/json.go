@@ -1,3 +1,6 @@
+// Package sources provides concurrent fetchers for the data behind each
+// glancectl pane: Alertmanager, the service-status shim, update-shim,
+// Uptime Kuma, Prometheus, and friends.
 package sources
 
 import (
